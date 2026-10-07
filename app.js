@@ -44,8 +44,91 @@
     }
     s.last = now();
     S.cards[card.id] = s;
+    logAnswer(card.id, ok);
     save();
+    Sync.schedule();
   }
+
+
+  // ---------- progress sync (ntfy.sh; card ids + counts only) ----------
+  function dayKey(t) { const d = new Date(t); return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); }
+  function logAnswer(id, ok) {
+    const today = dayKey(now());
+    if (!S.log || S.log.d !== today) {
+      if (S.log && S.log.r && S.log.r.length) Sync.queue(snapshot()); // keep yesterday's final snapshot
+      S.log = { d: today, r: [] };
+    }
+    S.log.r.push([id, ok ? 1 : 0, Math.round(now() / 1000)]);
+    S.active = (S.active || []).filter((d) => d !== today).concat([today]).slice(-60);
+  }
+  function snapshot() {
+    const decks = {};
+    DATA.decks.forEach((d) => {
+      let seen = 0, learned = 0, due = 0, nw = 0;
+      d.cards.forEach((c) => { const s = st(c.id); if (!s) { nw++; return; } seen++; if (s.step >= 1) learned++; if (s.due <= now()) due++; });
+      decks[d.id] = { n: d.cards.length, seen, learned, due, new: nw };
+    });
+    const snap = { v: 1, t: Math.round(now() / 1000), tz: -new Date().getTimezoneOffset(),
+      days: S.active || [], decks, today: S.log || null };
+    const stc = {};
+    Object.keys(S.cards).forEach((id) => { const s = S.cards[id]; stc[id] = [s.step, Math.round(s.due / 3600000), s.lapses || 0, s.seen || 0]; });
+    const withSt = Object.assign({}, snap, { st: stc });
+    const body = JSON.stringify(withSt);
+    if (body.length < 3900) return withSt;
+    snap.stOmitted = true;
+    return snap;
+  }
+  const Sync = (function () {
+    const URL_ = (window.HINDI_SYNC || {}).url;
+    const QKEY = "hindiCards.pending";
+    let timer = null, firstPending = 0;
+    const loadQ = () => { try { return JSON.parse(localStorage.getItem(QKEY)) || []; } catch (e) { return []; } };
+    const saveQ = (q) => { try { localStorage.setItem(QKEY, JSON.stringify(q.slice(-10))); } catch (e) {} };
+    function queue(snap) {
+      const q = loadQ();
+      const last = q[q.length - 1];
+      if (last && last.today && snap.today && last.today.d === snap.today.d) q[q.length - 1] = snap; else q.push(snap);
+      saveQ(q);
+    }
+    function flush(useBeacon) {
+      if (!URL_) return;
+      const q = loadQ();
+      if (!q.length || (navigator.onLine === false)) return;
+      if (useBeacon && navigator.sendBeacon) {
+        let sent = 0;
+        q.forEach((snap) => { if (navigator.sendBeacon(URL_, new Blob([JSON.stringify(snap)], { type: "text/plain" }))) sent++; });
+        if (sent === q.length) saveQ([]);
+        return;
+      }
+      (async () => {
+        const rest = q.slice();
+        while (rest.length) {
+          try {
+            const r = await fetch(URL_, { method: "POST", body: JSON.stringify(rest[0]), keepalive: true, headers: { "Content-Type": "text/plain" } });
+            if (!r.ok) break;
+            rest.shift();
+          } catch (e) { break; }
+        }
+        // keep anything newer that was queued meanwhile
+        const cur = loadQ();
+        saveQ(cur.slice(q.length - rest.length));
+      })();
+    }
+    function schedule() {
+      queue(snapshot());
+      clearTimeout(timer);
+      if (!firstPending) firstPending = now();
+      // send 20 s after the last answer, but at least every 2 minutes while studying
+      const wait = Math.max(0, Math.min(20000, firstPending + 120000 - now()));
+      timer = setTimeout(() => { firstPending = 0; flush(false); }, wait);
+    }
+    function sendNow(beacon) { clearTimeout(timer); firstPending = 0; flush(beacon); }
+    window.addEventListener("online", () => flush(false));
+    document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") sendNow(true); });
+    window.addEventListener("pagehide", () => sendNow(true));
+    setTimeout(() => flush(false), 3000); // anything left from an offline session
+    return { schedule, queue, sendNow };
+  })();
 
   // ---------- audio ----------
   let seqToken = 0;
@@ -98,7 +181,7 @@
       </div>`);
     $app.querySelectorAll("[data-deck]").forEach((b) => (b.onclick = () => startDeck(deckById[b.dataset.deck])));
     $app.querySelector("[data-due]").onclick = () => { if (totalDue) startDue(); };
-    document.getElementById("reset").onclick = () => { if (confirm("Erase all flashcard progress on this phone?")) { S.cards = {}; save(); home(); } };
+    document.getElementById("reset").onclick = () => { if (confirm("Erase all flashcard progress on this phone?")) { S.cards = {}; S.log = null; S.active = []; save(); Sync.queue(Object.assign(snapshot(), { reset: true })); Sync.sendNow(false); home(); } };
   }
 
   // ---------- session ----------
@@ -183,6 +266,7 @@
   }
   function finished() {
     seqToken++;
+    if (sess && sess.total) Sync.sendNow(false);
     const deck = sess.deck;
     const moreNew = deck ? counts(deck).nw : 0;
     let totalDue = 0; DATA.decks.forEach((d) => (totalDue += counts(d).due));
