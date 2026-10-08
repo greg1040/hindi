@@ -196,8 +196,9 @@
     runSession(due, null);
   }
   function runSession(queue, deck) {
-    if (!queue.length) { sess = { queue: [], deck, total: 0, done: 0, missed: {} }; return finished(); }
-    sess = { queue: queue.slice(), deck, total: queue.length, done: 0, missed: {} };
+    // hist: cards already answered this session (for swiping back); view: index in hist, or -1 = current card
+    if (!queue.length) { sess = { queue: [], deck, total: 0, done: 0, missed: {}, hist: [], view: -1, flipped: false }; return finished(); }
+    sess = { queue: queue.slice(), deck, total: queue.length, done: 0, missed: {}, hist: [], view: -1, flipped: false };
     showFront();
   }
   function topBar() {
@@ -209,9 +210,10 @@
     if (c.kind === "char") return [c.a.char];
     return [c.a.slow];
   }
-  function showFront() {
+  function showFront(anim) {
     const c = sess.queue[0];
     if (!c) return finished();
+    sess.view = -1; sess.flipped = false;
     let body;
     if (c.kind === "char") {
       body = `<div class="hi char">${esc(c.hi)}</div>` + (c.matra ? `<div class="matra">${esc(c.matra.length ? "◌" + c.matra : "")} &nbsp; <b>${esc(c.matraEx)}</b></div>` : "");
@@ -221,16 +223,16 @@
     h(`${topBar()}<div class="stage">
       <div class="card" id="card"><span class="tag deva">${TAG[c.kind] || ""}</span>${body}
         <div class="spk"><button id="spk" aria-label="Play">🔊</button></div>
-        <span class="hint">👆 🔊</span></div>
+        <span class="hint">👆 🔊</span>${peekBtn()}</div>
       <div class="actions"><button class="show" id="flip">Show answer</button></div></div>`);
     document.getElementById("home").onclick = home;
     const spk = document.getElementById("spk");
-    document.getElementById("card").onclick = () => play(frontAudio(c), spk);
+    document.getElementById("card").onclick = () => { if (justSwiped()) return; play(frontAudio(c), spk); };
     spk.onclick = (e) => { e.stopPropagation(); play(frontAudio(c), spk); };
-    document.getElementById("flip").onclick = showBack;
+    document.getElementById("flip").onclick = () => showBack();
+    wireNav(anim);
   }
-  function showBack() {
-    const c = sess.queue[0];
+  function backParts(c) {
     let body, buttons;
     if (c.kind === "char") {
       body = `<div class="hi char">${esc(c.hi)}</div>
@@ -246,16 +248,100 @@
         ${c.note ? `<div class="note">${rich(c.note)}</div>` : ""}`;
       buttons = `<button data-a="${c.a.slow}">🐢 Slow</button><button data-a="${c.a.normal}">🔊 Normal</button>`;
     }
+    return { body, buttons };
+  }
+  function showBack(anim) {
+    const c = sess.queue[0];
+    sess.view = -1; sess.flipped = true;
+    const { body, buttons } = backParts(c);
     h(`${topBar()}<div class="stage">
-      <div class="card backside" id="card">${body}<div class="spk">${buttons}</div></div>
+      <div class="card backside" id="card">${body}<div class="spk">${buttons}</div>${peekBtn()}</div>
       <div class="actions"><button class="again" id="again">Again</button><button class="got" id="got">Got it</button></div></div>`);
     document.getElementById("home").onclick = home;
     $app.querySelectorAll(".spk button").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); play(b.dataset.a, b); }));
     document.getElementById("again").onclick = () => answer(false);
     document.getElementById("got").onclick = () => answer(true);
+    wireNav(anim);
   }
+
+  // ---------- looking back at earlier cards (read-only: never grades, schedules or syncs) ----------
+  const peekBtn = () => (sess && sess.hist.length ? `<button class="peek" id="peek" aria-label="Earlier cards">‹ earlier</button>` : "");
+  let lastSwipeAt = 0;
+  const justSwiped = () => now() - lastSwipeAt < 400; // ignore a stray click right after a swipe
+  function showPast(i, anim) {
+    const c = sess.hist[i];
+    sess.view = i;
+    const { body, buttons } = backParts(c);
+    const n = sess.hist.length;
+    const atEnd = !sess.queue.length;
+    h(`${topBar()}<div class="stage">
+      <div class="card backside past" id="card"><span class="earlier">Earlier card ${i + 1} of ${n}</span>${body}<div class="spk">${buttons}</div></div>
+      <div class="actions nav"><button class="arrow" id="prev" aria-label="Previous card"${i ? "" : " disabled"}>‹</button><button class="cur" id="cur">${atEnd ? "Back to the end ✓" : "Back to current card"}</button><button class="arrow" id="next" aria-label="Next card">›</button></div></div>`);
+    document.getElementById("home").onclick = home;
+    $app.querySelectorAll(".spk button").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); play(b.dataset.a, b); }));
+    document.getElementById("prev").onclick = () => navBack();
+    document.getElementById("next").onclick = () => navForward();
+    document.getElementById("cur").onclick = () => toCurrent("in-left");
+    wireNav(anim);
+  }
+  function toCurrent(anim) {
+    if (!sess.queue.length) return finished(anim, true);
+    return sess.flipped ? showBack(anim) : showFront(anim);
+  }
+  function navBack() {
+    if (!sess || !sess.hist.length) return false;
+    if (sess.view === -1) showPast(sess.hist.length - 1, "in-right");
+    else if (sess.view > 0) showPast(sess.view - 1, "in-right");
+    else return false;
+    return true;
+  }
+  function navForward() {
+    if (!sess || sess.view === -1) return false;
+    if (sess.view < sess.hist.length - 1) showPast(sess.view + 1, "in-left");
+    else toCurrent("in-left");
+    return true;
+  }
+  // swipe right (finger left→right) = earlier card; swipe left = forward again
+  function wireNav(anim) {
+    const el = document.getElementById("card");
+    if (!el) return;
+    if (anim) { el.classList.add(anim); el.addEventListener("animationend", () => el.classList.remove(anim), { once: true }); }
+    const pk = document.getElementById("peek");
+    if (pk) pk.onclick = (e) => { e.stopPropagation(); navBack(); };
+    let x0 = 0, y0 = 0, axis = null, dx = 0;
+    el.addEventListener("touchstart", (e) => {
+      if (e.touches.length !== 1) { axis = "none"; return; }
+      x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; axis = null; dx = 0;
+      el.style.transition = "";
+    }, { passive: true });
+    el.addEventListener("touchmove", (e) => {
+      if (axis === "none" || e.touches.length !== 1) return;
+      const mx = e.touches[0].clientX - x0, my = e.touches[0].clientY - y0;
+      if (!axis) {
+        if (Math.abs(mx) < 10 && Math.abs(my) < 10) return;
+        axis = Math.abs(mx) > Math.abs(my) ? "x" : "y"; // vertical = normal scrolling, left alone
+      }
+      if (axis !== "x") return;
+      dx = mx;
+      el.style.transform = `translateX(${dx * 0.5}px)`;
+    }, { passive: true });
+    const end = (e) => {
+      if (axis !== "x") { axis = null; return; }
+      axis = null;
+      const t = e.changedTouches && e.changedTouches[0];
+      const ddx = t ? t.clientX - x0 : dx, ddy = t ? t.clientY - y0 : 0;
+      lastSwipeAt = now();
+      let moved = false;
+      if (Math.abs(ddx) >= 50 && Math.abs(ddx) > Math.abs(ddy)) moved = ddx > 0 ? navBack() : navForward();
+      if (!moved) { el.style.transition = "transform .2s ease"; el.style.transform = ""; }
+    };
+    el.addEventListener("touchend", end);
+    el.addEventListener("touchcancel", () => { axis = null; el.style.transition = "transform .2s ease"; el.style.transform = ""; });
+  }
+
   function answer(ok) {
     const c = sess.queue.shift();
+    sess.hist.push(c);
     grade(c, ok, !!sess.missed[c.id]);
     if (ok) sess.done++;
     else {
@@ -264,20 +350,24 @@
     }
     showFront();
   }
-  function finished() {
-    seqToken++;
-    if (sess && sess.total) Sync.sendNow(false);
+  function finished(anim, revisit) {
+    if (!revisit) seqToken++;
+    if (sess && sess.total && !revisit) Sync.sendNow(false);
+    if (sess) sess.view = -1;
     const deck = sess.deck;
     const moreNew = deck ? counts(deck).nw : 0;
     let totalDue = 0; DATA.decks.forEach((d) => (totalDue += counts(d).due));
     h(`<div class="top"><button class="back" id="home">‹</button><h1>${deck ? esc(deck.title) : "Review"}</h1></div>
-      <div class="done"><div class="big">🎉</div><h2>बहुत अच्छा!</h2>
+      <div class="done" id="card"><div class="big">🎉</div><h2>बहुत अच्छा!</h2>
       <div>${sess.total ? `You finished ${sess.total} card${sess.total > 1 ? "s" : ""}.` : "Nothing to study here right now."}</div>
       ${moreNew ? `<button id="more">Learn ${Math.min(moreNew, NEW_PER_SESSION)} more new</button>` : ""}
       ${totalDue ? `<button id="due">Review due (${totalDue})</button>` : ""}
-      <button class="sec" id="h2">Home</button></div>`);
+      <button class="sec" id="h2">Home</button>
+      ${sess.hist && sess.hist.length ? `<button class="sec" id="review">‹ See this session's cards again</button>` : ""}</div>`);
     document.getElementById("home").onclick = home;
     document.getElementById("h2").onclick = home;
+    const rv = document.getElementById("review"); if (rv) rv.onclick = () => navBack();
+    wireNav(anim);
     const m = document.getElementById("more"); if (m) m.onclick = () => startDeck(deck);
     const d = document.getElementById("due"); if (d) d.onclick = startDue;
   }

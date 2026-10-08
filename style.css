@@ -66,3 +66,16 @@ button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
 .done h2{margin:0;font-family:var(--deva)}
 .done button{background:var(--saffron);color:#fff;border-radius:16px;padding:14px 22px;font-size:18px;font-weight:700;min-width:220px}
 .done button.sec{background:#fff;color:var(--ink);border:1px solid var(--line)}
+/* swipe back through earlier cards (read-only) */
+.card,.done{touch-action:pan-y}
+.card .peek{position:absolute;top:8px;right:10px;font-size:13px;color:var(--muted);padding:6px 8px;border-radius:12px}
+.card .earlier{position:absolute;top:10px;left:0;right:0;font-size:13px;color:#b24f12;font-weight:600}
+.card.past{border-color:#f0c9a8;background:#fffdf9;padding-top:36px}
+.actions.nav .arrow{flex:0 0 56px;background:#fff;color:var(--ink);border:1px solid var(--line);font-size:28px}
+.actions.nav .arrow:disabled{opacity:.35}
+.actions.nav .cur{background:var(--blue);font-size:17px}
+@keyframes inRight{from{transform:translateX(-40%);opacity:0}to{transform:none;opacity:1}}
+@keyframes inLeft{from{transform:translateX(40%);opacity:0}to{transform:none;opacity:1}}
+.in-right{animation:inRight .22s ease-out}
+.in-left{animation:inLeft .22s ease-out}
+@media (prefers-reduced-motion:reduce){.in-right,.in-left{animation:none}}
