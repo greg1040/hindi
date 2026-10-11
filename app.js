@@ -61,58 +61,100 @@
     S.log.r.push([id, ok ? 1 : 0, Math.round(now() / 1000)]);
     S.active = (S.active || []).filter((d) => d !== today).concat([today]).slice(-60);
   }
-  function snapshot() {
+  function snapshot(tAt) {
     const decks = {};
     DATA.decks.forEach((d) => {
       let seen = 0, learned = 0, due = 0, nw = 0;
       d.cards.forEach((c) => { const s = st(c.id); if (!s) { nw++; return; } seen++; if (s.step >= 1) learned++; if (s.due <= now()) due++; });
       decks[d.id] = { n: d.cards.length, seen, learned, due, new: nw };
     });
-    const snap = { v: 1, t: Math.round(now() / 1000), tz: -new Date().getTimezoneOffset(),
+    const snap = { v: 1, t: Math.round((tAt || now()) / 1000), tz: -new Date().getTimezoneOffset(),
       days: S.active || [], decks, today: S.log || null };
     const stc = {};
     Object.keys(S.cards).forEach((id) => { const s = S.cards[id]; stc[id] = [s.step, Math.round(s.due / 3600000), s.lapses || 0, s.seen || 0]; });
+    // ntfy.sh turns bodies over 4096 bytes into a 3-hour attachment, so keep every snapshot under ~3900 bytes
+    const MAX = 3900;
     const withSt = Object.assign({}, snap, { st: stc });
-    const body = JSON.stringify(withSt);
-    if (body.length < 3900) return withSt;
+    if (JSON.stringify(withSt).length < MAX) return withSt;
     snap.stOmitted = true;
+    if (snap.today && snap.today.r && JSON.stringify(snap).length >= MAX) {
+      // very long day: keep only the newest answers (earlier ones went out in earlier snapshots)
+      const r = snap.today.r;
+      const t2 = { d: snap.today.d, r: r.slice(), rn: r.length };
+      snap.today = t2;
+      while (t2.r.length && JSON.stringify(snap).length >= MAX) t2.r.splice(0, Math.max(1, Math.ceil(t2.r.length / 10)));
+    }
     return snap;
+  }
+  // time of the last answer (so a re-send of old progress isn't mistaken for new study)
+  function lastActivity() {
+    let t = 0;
+    Object.keys(S.cards).forEach((id) => { if ((S.cards[id].last || 0) > t) t = S.cards[id].last; });
+    return t;
   }
   const Sync = (function () {
     const URL_ = (window.HINDI_SYNC || {}).url;
-    const QKEY = "hindiCards.pending";
-    let timer = null, firstPending = 0;
-    const loadQ = () => { try { return JSON.parse(localStorage.getItem(QKEY)) || []; } catch (e) { return []; } };
-    const saveQ = (q) => { try { localStorage.setItem(QKEY, JSON.stringify(q.slice(-10))); } catch (e) {} };
+    const QKEY = "hindiCards.pending";   // snapshots not yet confirmed by ntfy.sh
+    const LKEY = "hindiCards.lastSnap";  // newest snapshot (re-sent on open: ntfy keeps messages only ~12 h)
+    const AKEY = "hindiCards.ack";       // {t, at}: newest snapshot ntfy confirmed, and when
+    const RESEND_MS = 6 * 3600000;
+    let timer = null, firstPending = 0, sending = false;
+    const get = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) || d; } catch (e) { return d; } };
+    const put = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
+    const loadQ = () => get(QKEY, []);
+    const saveQ = (q) => put(QKEY, q.slice(-10));
     function queue(snap) {
       const q = loadQ();
       const last = q[q.length - 1];
-      if (last && last.today && snap.today && last.today.d === snap.today.d) q[q.length - 1] = snap; else q.push(snap);
+      if (last && last.today && snap.today && last.today.d === snap.today.d && !last.reset) q[q.length - 1] = snap; else q.push(snap);
       saveQ(q);
+      const ls = get(LKEY, null);
+      if (!ls || snap.t >= ls.t) put(LKEY, snap);
     }
+    // Snapshots stay queued until a fetch() gets a 200 from ntfy. sendBeacon can't confirm delivery,
+    // so it is only a best-effort extra on page hide; the queue is retried on the next open/answer.
     function flush(useBeacon) {
       if (!URL_) return;
       const q = loadQ();
       if (!q.length || (navigator.onLine === false)) return;
-      if (useBeacon && navigator.sendBeacon) {
-        let sent = 0;
-        q.forEach((snap) => { if (navigator.sendBeacon(URL_, new Blob([JSON.stringify(snap)], { type: "text/plain" }))) sent++; });
-        if (sent === q.length) saveQ([]);
+      if (useBeacon) {
+        if (navigator.sendBeacon) q.forEach((snap) => { try { navigator.sendBeacon(URL_, new Blob([JSON.stringify(snap)], { type: "text/plain" })); } catch (e) {} });
         return;
       }
+      if (sending) return;
+      sending = true;
       (async () => {
-        const rest = q.slice();
-        while (rest.length) {
+        const sent = [];
+        for (const snap of q) {
+          const body = JSON.stringify(snap);
           try {
-            const r = await fetch(URL_, { method: "POST", body: JSON.stringify(rest[0]), keepalive: true, headers: { "Content-Type": "text/plain" } });
+            const r = await fetch(URL_, { method: "POST", body, keepalive: true, headers: { "Content-Type": "text/plain" } });
             if (!r.ok) break;
-            rest.shift();
+            sent.push(body);
+            const a0 = get(AKEY, null);
+            put(AKEY, { t: Math.max(snap.t, (a0 && a0.t) || 0), at: now() });
           } catch (e) { break; }
         }
-        // keep anything newer that was queued meanwhile
-        const cur = loadQ();
-        saveQ(cur.slice(q.length - rest.length));
+        // drop exactly what was delivered; keep anything queued or replaced meanwhile
+        saveQ(loadQ().filter((s) => sent.indexOf(JSON.stringify(s)) < 0));
+        sending = false;
       })();
+    }
+    // On open/resume: make sure the newest progress is on ntfy.sh (covers sends that failed or expired).
+    function resync() {
+      if (!URL_) return;
+      let last = get(LKEY, null);
+      if (!last) {
+        if (!Object.keys(S.cards).length) return;
+        last = snapshot(lastActivity() || now()); // first run of this version: publish what's on the phone
+        put(LKEY, last);
+      }
+      const ack = get(AKEY, null);
+      const q = loadQ();
+      const confirmed = ack && ack.t >= last.t;
+      if (!q.length && confirmed && now() - ack.at < RESEND_MS) return;
+      if (!q.some((s) => s.t === last.t)) { q.push(last); saveQ(q); }
+      flush(false);
     }
     function schedule() {
       queue(snapshot());
@@ -124,9 +166,11 @@
     }
     function sendNow(beacon) { clearTimeout(timer); firstPending = 0; flush(beacon); }
     window.addEventListener("online", () => flush(false));
-    document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") sendNow(true); });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") sendNow(true); else setTimeout(resync, 1500);
+    });
     window.addEventListener("pagehide", () => sendNow(true));
-    setTimeout(() => flush(false), 3000); // anything left from an offline session
+    setTimeout(resync, 3000); // anything left from an offline/killed session, or progress that expired on ntfy
     return { schedule, queue, sendNow };
   })();
 
