@@ -4,7 +4,7 @@
   const DATA = window.HINDI_DATA || { decks: [] };
   const DAY = 86400000;
   const LADDER = [1, 3, 7, 14, 30, 60]; // days between reviews after each "Got it"
-  const NEW_PER_SESSION = 20;
+  const NEW_PER_SESSION = 20; // also the max cards in one session
   const KEY = "hindiCards.v1";
   const $app = document.getElementById("app");
   const player = document.getElementById("player");
@@ -29,6 +29,27 @@
     let due = 0, nw = 0;
     deck.cards.forEach((c) => { if (isNew(c.id)) nw++; else if (isDue(c.id)) due++; });
     return { due, nw };
+  }
+  function totalDueCount() {
+    let n = 0;
+    DATA.decks.forEach((d) => (n += counts(d).due));
+    return n;
+  }
+  const canAddNew = () => totalDueCount() < NEW_PER_SESSION;
+  function sessionQueue(deck) {
+    const source = deck ? deck.cards : allCards;
+    const due = source.filter((c) => isDue(c.id)).sort((a, b) => st(a.id).due - st(b.id).due);
+    const queue = due.slice(0, NEW_PER_SESSION);
+    if (deck && canAddNew() && queue.length < NEW_PER_SESSION) {
+      const nw = deck.cards.filter((c) => isNew(c.id)).slice(0, NEW_PER_SESSION - queue.length);
+      queue.push.apply(queue, nw);
+    }
+    return queue;
+  }
+  function deckIcon(d) {
+    if (d.type === "wife") return "❤️";
+    if (d.type === "chars") return "अ";
+    return Array.from(d.title || "")[0] || "•";
   }
 
   function grade(card, ok, missedThisSession) {
@@ -204,18 +225,25 @@
   // ---------- home ----------
   function home() {
     seqToken++;
-    const days = DATA.decks.filter((d) => d.type === "day").sort((a, b) => b.day - a.day);
+    const days = DATA.decks.filter((d) => d.type === "day").sort((a, b) => a.day - b.day);
     const wife = deckById.wife, chars = deckById.chars;
-    let totalDue = 0;
-    DATA.decks.forEach((d) => (totalDue += counts(d).due));
-    const pills = (d) => { const c = counts(d); return (c.due ? `<span class="pill dueP">${c.due} due</span>` : "") + (c.nw ? `<span class="pill new">${c.nw} new</span>` : "") + (!c.due && !c.nw ? `<span class="pill">✓ done</span>` : ""); };
+    const totalDue = totalDueCount();
+    const offerNew = canAddNew();
+    const pills = (d) => {
+      const c = counts(d);
+      const showNew = offerNew && c.nw;
+      return (c.due ? `<span class="pill dueP">${c.due} due</span>` : "") + (showNew ? `<span class="pill new">${c.nw} new</span>` : "") + (!c.due && !c.nw ? `<span class="pill">✓ done</span>` : "");
+    };
     const row = (d, ic, t1, t2) => `<button class="deck" data-deck="${d.id}"><div class="ic">${ic}</div><div class="t"><div class="t1">${t1}</div><div class="t2">${t2}</div></div><div>${pills(d)}</div></button>`;
+    const dueHint = totalDue > NEW_PER_SESSION
+      ? `Up to ${NEW_PER_SESSION} this session, then pick up here next time`
+      : "Cards from all categories that are ready for review";
     h(`<div class="top"><h1>हिंदी कार्ड</h1></div>
       <div class="home">
         <button class="due" data-due="1"><div class="big">${totalDue ? `Review due: ${totalDue}` : "Nothing due to review 🎉"}</div>
-        <div class="small">${totalDue ? "Cards from all decks that are ready for review" : "Learn new cards below"}</div></button>
-        <div class="sect">Daily lessons</div>
-        ${days.map((d) => row(d, d.day, `Day ${d.day}: ${esc(d.title)}`, `${esc(d.titleRom)} · ${esc(d.titleEn)}`)).join("")}
+        <div class="small">${totalDue ? dueHint : "Learn new cards below"}</div></button>
+        <div class="sect">Lessons</div>
+        ${days.map((d) => row(d, deckIcon(d), esc(d.title), `${esc(d.titleRom)} · ${esc(d.titleEn)}`)).join("")}
         <div class="sect">Special</div>
         ${wife ? row(wife, "❤️", esc(wife.title), esc(wife.titleEn)) : ""}
         ${chars ? row(chars, "अ", esc(chars.title), esc(chars.titleEn) + " · " + chars.cards.length + " cards") : ""}
@@ -230,14 +258,11 @@
 
   // ---------- session ----------
   let sess = null;
-  function startDeck(deck, extraNew) {
-    const due = deck.cards.filter((c) => isDue(c.id)).sort((a, b) => st(a.id).due - st(b.id).due);
-    const nw = deck.cards.filter((c) => isNew(c.id)).slice(0, NEW_PER_SESSION);
-    runSession(due.concat(nw), deck);
+  function startDeck(deck) {
+    runSession(sessionQueue(deck), deck);
   }
   function startDue() {
-    const due = allCards.filter((c) => isDue(c.id)).sort((a, b) => st(a.id).due - st(b.id).due);
-    runSession(due, null);
+    runSession(sessionQueue(null), null);
   }
   function runSession(queue, deck) {
     // hist: cards already answered this session (for swiping back); view: index in hist, or -1 = current card
@@ -246,7 +271,7 @@
     showFront();
   }
   function topBar() {
-    const title = sess.deck ? (sess.deck.type === "day" ? `Day ${sess.deck.day}: ${esc(sess.deck.title)}` : esc(sess.deck.title)) : "Review";
+    const title = sess.deck ? esc(sess.deck.title) : "Review";
     const pct = sess.total ? Math.round((sess.done / sess.total) * 100) : 0;
     return `<div class="top"><button class="back" id="home" aria-label="Home">‹</button><h1>${title}</h1><span class="count">${sess.queue.length} left</span></div><div class="bar"><i style="width:${pct}%"></i></div>`;
   }
@@ -399,11 +424,14 @@
     if (sess && sess.total && !revisit) Sync.sendNow(false);
     if (sess) sess.view = -1;
     const deck = sess.deck;
-    const moreNew = deck ? counts(deck).nw : 0;
-    let totalDue = 0; DATA.decks.forEach((d) => (totalDue += counts(d).due));
+    const moreNew = (deck && canAddNew()) ? counts(deck).nw : 0;
+    const totalDue = totalDueCount();
+    const emptyMsg = totalDue >= NEW_PER_SESSION
+      ? `You already have ${totalDue} cards waiting. Review those first, then you can learn new cards here.`
+      : "Nothing to study here right now.";
     h(`<div class="top"><button class="back" id="home">‹</button><h1>${deck ? esc(deck.title) : "Review"}</h1></div>
       <div class="done" id="card"><div class="big">🎉</div><h2>बहुत अच्छा!</h2>
-      <div>${sess.total ? `You finished ${sess.total} card${sess.total > 1 ? "s" : ""}.` : "Nothing to study here right now."}</div>
+      <div>${sess.total ? `You finished ${sess.total} card${sess.total > 1 ? "s" : ""}.` : emptyMsg}</div>
       ${moreNew ? `<button id="more">Learn ${Math.min(moreNew, NEW_PER_SESSION)} more new</button>` : ""}
       ${totalDue ? `<button id="due">Review due (${totalDue})</button>` : ""}
       <button class="sec" id="h2">Home</button>
